@@ -1,4 +1,4 @@
-name: Analyze EOS Utility 2.14.31.12c
+name: Analyze Canon EOS Utility 2.14.31.12c
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ permissions:
   contents: read
 
 jobs:
-  analyze:
-    name: Analyze EOS Utility 2 on ARM64
+  analyze-eos-utility:
+    name: Analyze EOS Utility 2.14.31.12c
     runs-on: macos-26
 
     env:
@@ -16,267 +16,547 @@ jobs:
       ZIP_NAME: "EU-Installset-M2.14.31.12c.dmg.zip"
 
     steps:
-      - name: Show runner information
+
+      # ============================================================
+      # 1. SYSTEM INFORMATION
+      # ============================================================
+
+      - name: Show system information
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
-          echo "=== SYSTEM ==="
-          uname -a
+          echo "=============================================="
+          echo "SYSTEM"
+          echo "=============================================="
+
+          uname -a || true
           echo
 
-          echo "=== ARCH ==="
-          uname -m
-          arch
+          echo "Machine architecture:"
+          uname -m || true
           echo
 
-          echo "=== MACOS ==="
-          sw_vers
+          echo "CPU:"
+          sysctl -n hw.machine 2>/dev/null || true
           echo
 
-          echo "=== XCODE ==="
-          xcodebuild -version || true
+          echo "macOS:"
+          sw_vers || true
+          echo
+
+          echo "Xcode:"
+          xcodebuild -version 2>/dev/null || true
+          echo
+
+          echo "Architecture:"
+          arch || true
+
+      # ============================================================
+      # 2. CREATE WORKSPACE
+      # ============================================================
 
       - name: Create workspace
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
           mkdir -p "$GITHUB_WORKSPACE/work"
-          mkdir -p "$GITHUB_WORKSPACE/report"
           mkdir -p "$GITHUB_WORKSPACE/extracted"
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          mkdir -p "$GITHUB_WORKSPACE/payload"
+          mkdir -p "$GITHUB_WORKSPACE/datax-analysis"
+
+      # ============================================================
+      # 3. DOWNLOAD ZIP
+      # ============================================================
 
       - name: Download EOS Utility archive
+        shell: bash
         working-directory: work
         run: |
-          set -euxo pipefail
+          set -u
 
-          curl \
+          echo "Downloading:"
+          echo "$DOWNLOAD_URL"
+          echo
+
+          rm -f "$ZIP_NAME"
+
+          if ! curl \
             --fail \
             --location \
             --retry 5 \
             --retry-delay 5 \
             --connect-timeout 30 \
+            --max-time 600 \
             --output "$ZIP_NAME" \
             "$DOWNLOAD_URL"
+          then
+            echo "ERROR: Download failed."
+            exit 1
+          fi
 
-          echo "=== DOWNLOADED FILE ==="
+          echo
+          echo "Downloaded:"
           ls -lh "$ZIP_NAME"
 
-          echo "=== FILE TYPE ==="
-          file "$ZIP_NAME"
+          echo
+          echo "File type:"
+          file "$ZIP_NAME" || true
 
-          echo "=== SHA256 ==="
-          shasum -a 256 "$ZIP_NAME" | tee \
-            "$GITHUB_WORKSPACE/report/archive.sha256"
+          echo
+          echo "SHA256:"
+          shasum -a 256 "$ZIP_NAME" \
+            | tee "$GITHUB_WORKSPACE/report/archive.sha256"
 
-      - name: Validate ZIP
+      # ============================================================
+      # 4. VALIDATE ZIP
+      # ============================================================
+
+      - name: Validate ZIP archive
+        shell: bash
         working-directory: work
         run: |
-          set -euxo pipefail
+          set -u
 
-          unzip -t "$ZIP_NAME" | tee \
-            "$GITHUB_WORKSPACE/report/zip-test.txt"
+          echo "Testing ZIP..."
+
+          if unzip -t "$ZIP_NAME" \
+            > "$GITHUB_WORKSPACE/report/zip-test.txt" 2>&1
+          then
+            echo "ZIP TEST: OK"
+          else
+            echo "ZIP TEST: FAILED"
+            cat "$GITHUB_WORKSPACE/report/zip-test.txt"
+            exit 1
+          fi
+
+      # ============================================================
+      # 5. EXTRACT ZIP
+      # ============================================================
 
       - name: Extract ZIP
+        shell: bash
         working-directory: extracted
         run: |
-          set -euxo pipefail
+          set -u
+
+          rm -rf ./*
+          rm -rf ./.??* 2>/dev/null || true
 
           unzip -o \
             "$GITHUB_WORKSPACE/work/$ZIP_NAME"
 
-          echo "=== EXTRACTED ==="
-          find . -maxdepth 4 -print | sort
+          echo "=============================================="
+          echo "EXTRACTED FILES"
+          echo "=============================================="
+
+          find . \
+            -print \
+            2>/dev/null \
+            | sort \
+            | tee "$GITHUB_WORKSPACE/report/extracted-files.txt"
+
+      # ============================================================
+      # 6. LOCATE DMG
+      # ============================================================
 
       - name: Locate DMG
         id: locate_dmg
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
-          DMG="$(find "$GITHUB_WORKSPACE/extracted" \
-            -type f \
-            -iname '*.dmg' \
-            -print -quit)"
+          DMG=""
+
+          while IFS= read -r FILE; do
+            DMG="$FILE"
+            break
+          done < <(
+            find "$GITHUB_WORKSPACE/extracted" \
+              -type f \
+              -iname '*.dmg' \
+              -print \
+              2>/dev/null
+          )
 
           if [ -z "$DMG" ]; then
-            echo "ERROR: No DMG found"
+            echo "ERROR: No DMG found."
             exit 1
           fi
 
           echo "DMG=$DMG" >> "$GITHUB_OUTPUT"
 
-          echo "=== DMG ==="
+          echo "DMG:"
+          echo "$DMG"
+
+          echo
+          echo "DMG size:"
           ls -lh "$DMG"
-          file "$DMG"
 
-          shasum -a 256 "$DMG" | tee \
-            "$GITHUB_WORKSPACE/report/dmg.sha256"
+          echo
+          echo "DMG file type:"
+          file "$DMG" || true
 
-      - name: Verify DMG
+          echo
+          echo "DMG SHA256:"
+          shasum -a 256 "$DMG" \
+            | tee "$GITHUB_WORKSPACE/report/dmg.sha256"
+
+      # ============================================================
+      # 7. DMG IMAGE INFORMATION
+      # ============================================================
+
+      - name: Analyze DMG image
         env:
           DMG: ${{ steps.locate_dmg.outputs.DMG }}
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
-          echo "=== hdiutil imageinfo ==="
+          echo "=============================================="
+          echo "DMG IMAGE INFO"
+          echo "=============================================="
 
-          hdiutil imageinfo "$DMG" | tee \
-            "$GITHUB_WORKSPACE/report/dmg-imageinfo.txt"
+          hdiutil imageinfo "$DMG" \
+            > "$GITHUB_WORKSPACE/report/dmg-imageinfo.txt" \
+            2>&1 || true
+
+          cat "$GITHUB_WORKSPACE/report/dmg-imageinfo.txt"
+
+      # ============================================================
+      # 8. MOUNT DMG
+      # ============================================================
 
       - name: Mount DMG
         id: mount_dmg
         env:
           DMG: ${{ steps.locate_dmg.outputs.DMG }}
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -u
 
           MOUNT_POINT="$RUNNER_TEMP/eos-dmg"
 
           mkdir -p "$MOUNT_POINT"
 
-          hdiutil attach "$DMG" \
+          echo "Mounting DMG..."
+
+          if ! hdiutil attach \
+            "$DMG" \
             -mountpoint "$MOUNT_POINT" \
             -nobrowse \
             -noautoopen
+          then
+            echo "ERROR: Unable to mount DMG."
+            exit 1
+          fi
 
           echo "MOUNT_POINT=$MOUNT_POINT" >> "$GITHUB_OUTPUT"
 
-          echo "=== DMG CONTENTS ==="
+          echo
+          echo "Mounted at:"
+          echo "$MOUNT_POINT"
 
-          find "$MOUNT_POINT" \
-            -maxdepth 5 \
-            -print \
-            | sort \
-            | tee "$GITHUB_WORKSPACE/report/dmg-contents.txt"
+      # ============================================================
+      # 9. LIST DMG CONTENTS SAFELY
+      # ============================================================
 
-      - name: Locate Applications
-        id: locate_app
+      - name: List DMG contents
         env:
           MOUNT_POINT: ${{ steps.mount_dmg.outputs.MOUNT_POINT }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
-          APP="$(find "$MOUNT_POINT" \
-            -type d \
-            -name '*.app' \
-            -print -quit)"
+          REPORT="$GITHUB_WORKSPACE/report/dmg-contents.txt"
 
-          if [ -z "$APP" ]; then
-            echo "No .app directly found in DMG."
-            echo "APP=" >> "$GITHUB_OUTPUT"
+          echo "=============================================="
+          echo "DMG CONTENTS"
+          echo "=============================================="
+
+          find "$MOUNT_POINT" \
+            \( \
+              -path "$MOUNT_POINT/.Trashes" \
+              -o -path "$MOUNT_POINT/.fseventsd" \
+              -o -path "$MOUNT_POINT/.TemporaryItems" \
+            \) -prune \
+            -o \
+            -print \
+            2>/dev/null \
+            | sort \
+            | tee "$REPORT"
+
+      # ============================================================
+      # 10. LOCATE INSTALLER APP
+      # ============================================================
+
+      - name: Locate Canon installer
+        id: locate_installer
+        env:
+          MOUNT_POINT: ${{ steps.mount_dmg.outputs.MOUNT_POINT }}
+        shell: bash
+        run: |
+          set -u
+
+          INSTALLER=""
+
+          while IFS= read -r APP; do
+            INSTALLER="$APP"
+            break
+          done < <(
+            find "$MOUNT_POINT" \
+              -type d \
+              -name '*.app' \
+              -print \
+              2>/dev/null
+          )
+
+          if [ -z "$INSTALLER" ]; then
+            echo "ERROR: No .app found."
+            exit 1
+          fi
+
+          echo "INSTALLER=$INSTALLER" >> "$GITHUB_OUTPUT"
+
+          echo "Installer:"
+          echo "$INSTALLER"
+
+      # ============================================================
+      # 11. ANALYZE INSTALLER INFO.PLIST
+      # ============================================================
+
+      - name: Analyze installer metadata
+        env:
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
+        run: |
+          set -u
+
+          REPORT="$GITHUB_WORKSPACE/report"
+
+          echo "=============================================="
+          echo "INSTALLER INFO.PLIST"
+          echo "=============================================="
+
+          if [ -f "$INSTALLER/Contents/Info.plist" ]; then
+
+            /usr/libexec/PlistBuddy \
+              -c "Print" \
+              "$INSTALLER/Contents/Info.plist" \
+              > "$REPORT/installer-info.plist.txt" \
+              2>&1 || true
+
+            cat "$REPORT/installer-info.plist.txt"
+
+          else
+
+            echo "Info.plist not found."
+
+          fi
+
+      # ============================================================
+      # 12. ANALYZE OFICORE
+      # ============================================================
+
+      - name: Analyze OFICore
+        env:
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
+        run: |
+          set -u
+
+          REPORT="$GITHUB_WORKSPACE/report"
+          OFICORE="$INSTALLER/Contents/MacOS/OFICore"
+
+          echo "=============================================="
+          echo "OFICORE"
+          echo "=============================================="
+
+          if [ ! -f "$OFICORE" ]; then
+            echo "OFICore not found."
             exit 0
           fi
 
-          echo "APP=$APP" >> "$GITHUB_OUTPUT"
+          echo "File:"
+          file "$OFICORE" \
+            | tee "$REPORT/oficore-file.txt"
 
-          echo "=== APPLICATION ==="
-          echo "$APP"
-
-      - name: Analyze application
-        if: steps.locate_app.outputs.APP != ''
-        env:
-          APP: ${{ steps.locate_app.outputs.APP }}
-        run: |
-          set -euxo pipefail
-
-          REPORT="$GITHUB_WORKSPACE/report"
-
-          echo "=== APP STRUCTURE ==="
-
-          find "$APP" \
-            -maxdepth 5 \
-            -print \
-            | sort \
-            > "$REPORT/app-structure.txt"
-
-          echo "=== INFO.PLIST ==="
-
-          /usr/libexec/PlistBuddy \
-            -c "Print" \
-            "$APP/Contents/Info.plist" \
-            > "$REPORT/Info.plist.txt" \
+          echo
+          echo "Architecture:"
+          lipo -info "$OFICORE" \
+            2>&1 \
+            | tee "$REPORT/oficore-architecture.txt" \
             || true
 
-          echo "=== PLIST BUDDY VALUES ==="
+          echo
+          echo "Mach-O header:"
+          otool -hv "$OFICORE" \
+            2>&1 \
+            | tee "$REPORT/oficore-header.txt" \
+            || true
 
-          for KEY in \
-            CFBundleIdentifier \
-            CFBundleName \
-            CFBundleDisplayName \
-            CFBundleShortVersionString \
-            CFBundleVersion \
-            LSMinimumSystemVersion \
-            LSArchitecturePriority
-          do
-            echo "----- $KEY -----"
+          echo
+          echo "Linked libraries:"
+          otool -L "$OFICORE" \
+            2>&1 \
+            | tee "$REPORT/oficore-libraries.txt" \
+            || true
 
-            /usr/libexec/PlistBuddy \
-              -c "Print :$KEY" \
-              "$APP/Contents/Info.plist" \
-              2>/dev/null || true
-          done | tee "$REPORT/plist-important.txt"
+          echo
+          echo "Strings:"
+          strings -a "$OFICORE" \
+            > "$REPORT/oficore-all-strings.txt" \
+            2>/dev/null || true
 
-      - name: Find all executables
-        if: steps.locate_app.outputs.APP != ''
+          grep -Ei \
+            'canon|eos|edsdk|camera|utility|installer|package|framework|dylib|pkg' \
+            "$REPORT/oficore-all-strings.txt" \
+            | sort -u \
+            > "$REPORT/oficore-relevant-strings.txt" \
+            || true
+
+      # ============================================================
+      # 13. ANALYZE DATAX
+      # ============================================================
+
+      - name: Analyze Data.datx
         env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
+
+          DATAX="$INSTALLER/Contents/Resources/Data.datx"
+          OUT="$GITHUB_WORKSPACE/datax-analysis"
+
+          mkdir -p "$OUT"
+
+          echo "=============================================="
+          echo "DATA.DATX"
+          echo "=============================================="
+
+          if [ ! -f "$DATAX" ]; then
+            echo "Data.datx not found."
+            exit 0
+          fi
+
+          echo "File:"
+          ls -lh "$DATAX"
+
+          echo
+          echo "Type:"
+          file "$DATAX" \
+            | tee "$OUT/file.txt"
+
+          echo
+          echo "SHA256:"
+          shasum -a 256 "$DATAX" \
+            | tee "$OUT/sha256.txt"
+
+          echo
+          echo "Header:"
+          xxd -l 512 "$DATAX" \
+            > "$OUT/header.txt" \
+            2>&1 || true
+
+          cat "$OUT/header.txt"
+
+          echo
+          echo "Extracting strings..."
+
+          strings -a "$DATAX" \
+            > "$OUT/all-strings.txt" \
+            2>/dev/null || true
+
+          grep -Ei \
+            'canon|eos|edsdk|camera|utility|framework|dylib|pkg|\.app|\.framework|\.bundle|\.plugin' \
+            "$OUT/all-strings.txt" \
+            | sort -u \
+            > "$OUT/relevant-strings.txt" \
+            || true
+
+          echo
+          echo "Relevant strings:"
+          cat "$OUT/relevant-strings.txt" || true
+
+      # ============================================================
+      # 14. SEARCH FOR PAYLOAD FILES
+      # ============================================================
+
+      - name: Search installer payload
+        env:
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
+        run: |
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
-          echo "=== EXECUTABLE FILES ==="
+          echo "=============================================="
+          echo "PAYLOAD FILE SEARCH"
+          echo "=============================================="
 
-          find "$APP" \
+          find "$INSTALLER" \
             -type f \
-            -perm -111 \
+            \( \
+              -iname '*.pkg' \
+              -o -iname '*.mpkg' \
+              -o -iname '*.dmg' \
+              -o -iname '*.zip' \
+              -o -iname '*.tar' \
+              -o -iname '*.gz' \
+              -o -iname '*.bz2' \
+              -o -iname '*.xar' \
+              -o -iname '*.cab' \
+              -o -iname '*.dat' \
+              -o -iname '*.datx' \
+              -o -iname '*.bin' \
+            \) \
             -print \
+            2>/dev/null \
             | sort \
-            | tee "$REPORT/executables.txt"
+            | tee "$REPORT/payload-files.txt"
 
-      - name: Analyze Mach-O architectures
-        if: steps.locate_app.outputs.APP != ''
+      # ============================================================
+      # 15. SEARCH CANON/EOS FILES
+      # ============================================================
+
+      - name: Search Canon EOS files
         env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
-          : > "$REPORT/macho-architectures.txt"
+          find "$INSTALLER" \
+            -print \
+            2>/dev/null \
+            | grep -Ei \
+              'canon|eos|edsdk|camera|utility|dylib|framework|bundle|plugin|pkg' \
+            | sort \
+            > "$REPORT/canon-eos-files.txt" \
+            || true
 
-          while IFS= read -r FILE; do
+          echo "=============================================="
+          echo "CANON / EOS FILES"
+          echo "=============================================="
 
-            echo "==================================================" \
-              | tee -a "$REPORT/macho-architectures.txt"
+          cat "$REPORT/canon-eos-files.txt" || true
 
-            echo "$FILE" \
-              | tee -a "$REPORT/macho-architectures.txt"
+      # ============================================================
+      # 16. SEARCH ALL MACH-O
+      # ============================================================
 
-            echo "--------------------------------------------------" \
-              | tee -a "$REPORT/macho-architectures.txt"
-
-            file "$FILE" \
-              | tee -a "$REPORT/macho-architectures.txt"
-
-            lipo -info "$FILE" \
-              2>&1 \
-              | tee -a "$REPORT/macho-architectures.txt" \
-              || true
-
-            otool -hv "$FILE" \
-              2>&1 \
-              | head -30 \
-              | tee -a "$REPORT/macho-architectures.txt" \
-              || true
-
-          done < "$REPORT/executables.txt"
-
-      - name: Find Mach-O files including frameworks
-        if: steps.locate_app.outputs.APP != ''
+      - name: Find all Mach-O binaries
         env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
@@ -293,21 +573,32 @@ jobs:
             esac
 
           done < <(
-            find "$APP" -type f -print
+            find "$INSTALLER" \
+              -type f \
+              -print \
+              2>/dev/null
           )
 
-          sort -u "$REPORT/all-mach-o.txt" \
+          sort -u \
+            "$REPORT/all-mach-o.txt" \
             -o "$REPORT/all-mach-o.txt"
 
-          echo "=== ALL MACH-O ==="
-          cat "$REPORT/all-mach-o.txt"
+          echo "=============================================="
+          echo "MACH-O FILES"
+          echo "=============================================="
+
+          cat "$REPORT/all-mach-o.txt" || true
+
+      # ============================================================
+      # 17. ANALYZE ALL MACH-O ARCHITECTURES
+      # ============================================================
 
       - name: Analyze all Mach-O architectures
-        if: steps.locate_app.outputs.APP != ''
         env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
@@ -316,27 +607,39 @@ jobs:
           while IFS= read -r FILE; do
 
             echo "==================================================" \
-              | tee -a "$REPORT/all-macho-architectures.txt"
+              >> "$REPORT/all-macho-architectures.txt"
 
             echo "$FILE" \
-              | tee -a "$REPORT/all-macho-architectures.txt"
+              >> "$REPORT/all-macho-architectures.txt"
+
+            echo "--------------------------------------------------" \
+              >> "$REPORT/all-macho-architectures.txt"
 
             file "$FILE" \
-              | tee -a "$REPORT/all-macho-architectures.txt"
+              >> "$REPORT/all-macho-architectures.txt" \
+              2>&1 || true
 
             lipo -info "$FILE" \
-              2>&1 \
-              | tee -a "$REPORT/all-macho-architectures.txt" \
-              || true
+              >> "$REPORT/all-macho-architectures.txt" \
+              2>&1 || true
+
+            otool -hv "$FILE" \
+              | head -40 \
+              >> "$REPORT/all-macho-architectures.txt" \
+              2>&1 || true
 
           done < "$REPORT/all-mach-o.txt"
 
+          cat "$REPORT/all-macho-architectures.txt"
+
+      # ============================================================
+      # 18. ANALYZE LINKED LIBRARIES
+      # ============================================================
+
       - name: Analyze linked libraries
-        if: steps.locate_app.outputs.APP != ''
-        env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
@@ -344,31 +647,26 @@ jobs:
 
           while IFS= read -r FILE; do
 
-            TYPE="$(file -b "$FILE" 2>/dev/null || true)"
+            echo "==================================================" \
+              >> "$REPORT/linked-libraries.txt"
 
-            if [[ "$TYPE" == *"Mach-O"* ]]; then
+            echo "$FILE" \
+              >> "$REPORT/linked-libraries.txt"
 
-              echo "==================================================" \
-                >> "$REPORT/linked-libraries.txt"
-
-              echo "$FILE" \
-                >> "$REPORT/linked-libraries.txt"
-
-              otool -L "$FILE" \
-                2>&1 \
-                >> "$REPORT/linked-libraries.txt" \
-                || true
-
-            fi
+            otool -L "$FILE" \
+              >> "$REPORT/linked-libraries.txt" \
+              2>&1 || true
 
           done < "$REPORT/all-mach-o.txt"
 
-      - name: Search Canon / EDSDK references
-        if: steps.locate_app.outputs.APP != ''
-        env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+      # ============================================================
+      # 19. SEARCH CANON / EOS / EDSDK STRINGS
+      # ============================================================
+
+      - name: Search Canon and EDSDK strings
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
@@ -376,229 +674,293 @@ jobs:
 
           while IFS= read -r FILE; do
 
-            TYPE="$(file -b "$FILE" 2>/dev/null || true)"
+            echo "==================================================" \
+              >> "$REPORT/canon-strings.txt"
 
-            if [[ "$TYPE" == *"Mach-O"* ]]; then
+            echo "$FILE" \
+              >> "$REPORT/canon-strings.txt"
 
-              echo "==================================================" \
-                >> "$REPORT/canon-strings.txt"
-
-              echo "$FILE" \
-                >> "$REPORT/canon-strings.txt"
-
-              strings -a "$FILE" 2>/dev/null \
-                | grep -Ei \
-                  'canon|eos|edsdk|camera|remote|live.?view|cr2|download|capture' \
-                | sort -u \
-                >> "$REPORT/canon-strings.txt" \
-                || true
-
-            fi
+            strings -a "$FILE" \
+              2>/dev/null \
+              | grep -Ei \
+                'canon|eos|edsdk|camera|remote.?shoot|live.?view|cr2|download|capture|shutter' \
+              | sort -u \
+              >> "$REPORT/canon-strings.txt" \
+              || true
 
           done < "$REPORT/all-mach-o.txt"
 
-      - name: Code signing analysis
-        if: steps.locate_app.outputs.APP != ''
+      # ============================================================
+      # 20. CODE SIGNATURE
+      # ============================================================
+
+      - name: Analyze code signatures
         env:
-          APP: ${{ steps.locate_app.outputs.APP }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
-
-          echo "=== CODESIGN ==="
 
           codesign \
             -dv \
             --verbose=4 \
-            "$APP" \
+            "$INSTALLER" \
             > "$REPORT/codesign.txt" \
-            2>&1 \
-            || true
-
-          echo "=== CODE SIGN VERIFICATION ==="
+            2>&1 || true
 
           codesign \
             --verify \
             --deep \
             --strict \
             --verbose=4 \
-            "$APP" \
+            "$INSTALLER" \
             > "$REPORT/codesign-verify.txt" \
-            2>&1 \
-            || true
-
-      - name: Entitlements
-        if: steps.locate_app.outputs.APP != ''
-        env:
-          APP: ${{ steps.locate_app.outputs.APP }}
-        run: |
-          set -euo pipefail
+            2>&1 || true
 
           codesign \
             -d \
             --entitlements :- \
-            "$APP" \
-            > "$GITHUB_WORKSPACE/report/entitlements.plist" \
-            2>&1 \
-            || true
+            "$INSTALLER" \
+            > "$REPORT/entitlements.plist" \
+            2>&1 || true
 
-      - name: Check install package
+      # ============================================================
+      # 21. INSTALLER PACKAGE SEARCH
+      # ============================================================
+
+      - name: Search PKG packages
         env:
           MOUNT_POINT: ${{ steps.mount_dmg.outputs.MOUNT_POINT }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
 
-          echo "=== PKG FILES ==="
-
           find "$MOUNT_POINT" \
             -type f \
-            \( -name '*.pkg' -o -name '*.mpkg' \) \
+            \( \
+              -name '*.pkg' \
+              -o -name '*.mpkg' \
+            \) \
             -print \
-            | tee "$REPORT/install-packages.txt"
+            2>/dev/null \
+            | sort \
+            > "$REPORT/install-packages.txt"
+
+          echo "=============================================="
+          echo "PKG FILES"
+          echo "=============================================="
+
+          cat "$REPORT/install-packages.txt" || true
+
+          : > "$REPORT/pkg-analysis.txt"
 
           while IFS= read -r PKG; do
 
             echo "==================================================" \
-              | tee -a "$REPORT/pkg-analysis.txt"
+              >> "$REPORT/pkg-analysis.txt"
 
             echo "$PKG" \
-              | tee -a "$REPORT/pkg-analysis.txt"
+              >> "$REPORT/pkg-analysis.txt"
 
             pkgutil \
               --check-signature "$PKG" \
-              2>&1 \
-              | tee -a "$REPORT/pkg-analysis.txt" \
-              || true
+              >> "$REPORT/pkg-analysis.txt" \
+              2>&1 || true
 
           done < "$REPORT/install-packages.txt"
 
-      - name: Extract installer packages if present
+      # ============================================================
+      # 22. SEARCH INSTALLER METADATA
+      # ============================================================
+
+      - name: Extract important plist values
         env:
-          MOUNT_POINT: ${{ steps.mount_dmg.outputs.MOUNT_POINT }}
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
-          mkdir -p "$GITHUB_WORKSPACE/pkg-extracted"
+          PLIST="$INSTALLER/Contents/Info.plist"
+          REPORT="$GITHUB_WORKSPACE/report/plist-important.txt"
 
-          while IFS= read -r PKG; do
+          : > "$REPORT"
 
-            NAME="$(basename "$PKG" .pkg)"
+          if [ -f "$PLIST" ]; then
 
-            mkdir -p "$GITHUB_WORKSPACE/pkg-extracted/$NAME"
+            for KEY in \
+              CFBundleIdentifier \
+              CFBundleName \
+              CFBundleDisplayName \
+              CFBundleShortVersionString \
+              CFBundleVersion \
+              LSMinimumSystemVersion \
+              LSArchitecturePriority
+            do
 
-            pkgutil \
-              --expand-full \
-              "$PKG" \
-              "$GITHUB_WORKSPACE/pkg-extracted/$NAME" \
-              || true
+              echo "----- $KEY -----" \
+                >> "$REPORT"
 
-          done < "$GITHUB_WORKSPACE/report/install-packages.txt"
+              /usr/libexec/PlistBuddy \
+                -c "Print :$KEY" \
+                "$PLIST" \
+                >> "$REPORT" \
+                2>&1 || true
 
-          find "$GITHUB_WORKSPACE/pkg-extracted" \
-            -maxdepth 6 \
-            -print \
-            | sort \
-            > "$GITHUB_WORKSPACE/report/pkg-contents.txt"
+              echo \
+                >> "$REPORT"
 
-      - name: Search entire extracted package
+            done
+
+          fi
+
+          cat "$REPORT"
+
+      # ============================================================
+      # 23. DETERMINE ARM64 POSSIBILITY
+      # ============================================================
+
+      - name: Generate architecture verdict
+        shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           REPORT="$GITHUB_WORKSPACE/report"
-
-          echo "=== CANON / EOS / EDSDK FILES ==="
-
-          find "$GITHUB_WORKSPACE" \
-            -type f \
-            \( \
-              -iname '*canon*' \
-              -o -iname '*eos*' \
-              -o -iname '*edsdk*' \
-            \) \
-            -not -path '*/report/*' \
-            -print \
-            | sort \
-            > "$REPORT/canon-eos-files.txt"
-
-          cat "$REPORT/canon-eos-files.txt"
-
-      - name: Generate summary
-        if: always()
-        env:
-          APP: ${{ steps.locate_app.outputs.APP }}
-        run: |
-          set -euo pipefail
-
-          REPORT="$GITHUB_WORKSPACE/report"
+          OUT="$REPORT/ARCHITECTURE-VERDICT.md"
 
           {
-            echo "# EOS Utility 2.14.31.12c Analysis"
+            echo "# EOS Utility 2.14.31.12c Architecture Analysis"
             echo
             echo "## Runner"
             echo
-            echo "- Architecture: $(uname -m)"
-            echo "- macOS: $(sw_vers -productVersion)"
+            echo "- Runner architecture: $(uname -m 2>/dev/null || echo unknown)"
+            echo "- macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
             echo
-            echo "## Archive"
+            echo "## Mach-O analysis"
             echo
-            echo "- File: $ZIP_NAME"
-            echo "- SHA256:"
-            cat "$REPORT/archive.sha256" || true
+            echo '```text'
+            cat "$REPORT/all-macho-architectures.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "## Interpretation"
+            echo
+            echo "The important architectures are:"
+            echo
+            echo "- arm64 = Apple Silicon native"
+            echo "- x86_64 = Intel"
+            echo "- arm64 x86_64 = Universal"
+            echo
+            echo "This report intentionally does not modify Canon binaries."
+          } > "$OUT"
+
+          cat "$OUT"
+
+      # ============================================================
+      # 24. GENERATE FINAL SUMMARY
+      # ============================================================
+
+      - name: Generate final summary
+        if: always()
+        env:
+          INSTALLER: ${{ steps.locate_installer.outputs.INSTALLER }}
+        shell: bash
+        run: |
+          set -u
+
+          REPORT="$GITHUB_WORKSPACE/report"
+          SUMMARY="$REPORT/SUMMARY.md"
+
+          {
+            echo "# Canon EOS Utility 2.14.31.12c Analysis"
+            echo
+            echo "## Source"
+            echo
+            echo "- Archive: $ZIP_NAME"
+            echo
+            echo "## macOS runner"
+            echo
+            echo "- Architecture: $(uname -m 2>/dev/null || echo unknown)"
+            echo "- macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
             echo
             echo "## DMG"
             echo
-            cat "$REPORT/dmg.sha256" || true
+            echo '```text'
+            cat "$REPORT/dmg.sha256" 2>/dev/null || true
+            echo '```'
             echo
-            echo "## Application"
+            echo "## Installer"
             echo
-            if [ -n "$APP" ]; then
-              echo "\`$APP\`"
-            else
-              echo "No .app found directly in DMG."
-            fi
+            echo "\`$INSTALLER\`"
             echo
-            echo "## Executables"
+            echo "## Important files"
             echo
-            cat "$REPORT/executables.txt" || true
+            echo '```text'
+            cat "$REPORT/canon-eos-files.txt" 2>/dev/null || true
+            echo '```'
             echo
-            echo "## Architectures"
+            echo "## Mach-O architectures"
             echo
-            cat "$REPORT/macho-architectures.txt" || true
+            echo '```text'
+            cat "$REPORT/all-macho-architectures.txt" 2>/dev/null || true
+            echo '```'
             echo
-            echo "## All Mach-O Architectures"
+            echo "## Linked libraries"
             echo
-            cat "$REPORT/all-macho-architectures.txt" || true
+            echo '```text'
+            cat "$REPORT/linked-libraries.txt" 2>/dev/null || true
+            echo '```'
             echo
-            echo "## Canon / EOS / EDSDK references"
+            echo "## Canon / EOS / EDSDK strings"
             echo
-            cat "$REPORT/canon-strings.txt" || true
-          } > "$REPORT/SUMMARY.md"
+            echo '```text'
+            cat "$REPORT/canon-strings.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "## Architecture verdict"
+            echo
+            cat "$REPORT/ARCHITECTURE-VERDICT.md" 2>/dev/null || true
+          } > "$SUMMARY"
 
-          cat "$REPORT/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 25. DETACH DMG
+      # ============================================================
 
       - name: Detach DMG
         if: always()
         env:
           MOUNT_POINT: ${{ steps.mount_dmg.outputs.MOUNT_POINT }}
+        shell: bash
         run: |
           set +e
 
-          if [ -n "${MOUNT_POINT:-}" ] && \
-             mount | grep -F "$MOUNT_POINT" >/dev/null 2>&1
-          then
-            hdiutil detach "$MOUNT_POINT" -force || true
+          if [ -n "${MOUNT_POINT:-}" ]; then
+
+            if mount | grep -F "$MOUNT_POINT" >/dev/null 2>&1; then
+              hdiutil detach \
+                "$MOUNT_POINT" \
+                -force \
+                2>&1 || true
+            fi
+
           fi
 
-      - name: Upload analysis
+      # ============================================================
+      # 26. UPLOAD REPORT
+      # ============================================================
+
+      - name: Upload complete analysis
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: EOS-Utility-2.14.31.12c-analysis
           path: |
             report/
+            datax-analysis/
             extracted/
-            pkg-extracted/
-          retention-days: 14
+          if-no-files-found: warn
+          retention-days: 30
